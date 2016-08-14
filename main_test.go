@@ -10,7 +10,7 @@ func Test_verifyWorkerCount(t *testing.T) {
 	}{
 		{1, 2, 1},
 		{3, 4, 3},
-		{4, 3, 2},
+		{4, 3, 3},
 		{10000, 10, 10},
 	}
 
@@ -33,12 +33,17 @@ func Test_calculateLoad(t *testing.T) {
 		{3, 3, 0, 0, 1},
 		{3, 3, 1, 1, 2},
 		{3, 3, 2, 2, 3},
+		{100, 3, 0, 0, 33},
+		{100, 3, 1, 33, 66},
+		{100, 3, 2, 66, 100},
+		{37, 2, 0, 0, 18},
+		{37, 2, 1, 18, 19},
 	}
 
 	for _, test := range tests {
 		start, end := calculateLoad(test.totalLoad, test.workers, test.turn)
 		if start != test.start && end != test.end {
-			t.Fatal("loads did not calculate")
+			t.Fatal("loads did not calculate for:", test)
 		}
 	}
 }
@@ -53,8 +58,10 @@ func Test_available(t *testing.T) {
 		{"madeupusernamenoonewillhave", true},
 	}
 
+	auth, cookie := getAuth()
+	// fmt.Println(cookie)
 	for _, test := range tests {
-		ok := available(test.name, "")
+		ok := available(test.name, auth, cookie)
 		if ok != test.expected {
 			t.Fatalf("expected: %t, received: %t, for name: %s", test.expected, ok, test.name)
 		}

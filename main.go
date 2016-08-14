@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -8,10 +9,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 func main() {
@@ -20,9 +24,9 @@ func main() {
 	var resultTotal uint64
 
 	filepath := flag.String("path", "", "The filepath of the names")
-	workers := flag.Int("workers", 2, "How many workers to run in parallel. (More scrapers are faster, but more prone to rate limiting or bandwith issues)")
+	workers := flag.Int("workers", 2, "How many workers to run concurrently. (More workers are faster but more prone to rate limiting or bandwith issues)")
 	sleep := flag.Int("sleep", 100, "Sleep duration between each workers task. (Millisecond)")
-	auth := flag.String("auth", "", "authenticity_token for post request to github")
+	// auth := flag.String("auth", "", "authenticity_token for post request to github")
 	flag.Parse()
 
 	var data []byte
@@ -45,6 +49,9 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+
+	// Get auth token
+	auth, cookie := getAuth()
 
 	// Generate the word list from the filepath provided
 	names, err := splitData(data)
@@ -75,7 +82,7 @@ func main() {
 			defer wg.Done()
 			start, end := calculateLoad(len(names), *workers, i)
 			for _, n := range names[start:end] {
-				ok := available(n, *auth)
+				ok := available(n, auth, cookie)
 				if ok {
 					results <- n
 					time.Sleep(time.Duration(*sleep) * time.Millisecond)
@@ -88,11 +95,10 @@ func main() {
 	fmt.Printf("Found %d results in %f seconds \n", resultTotal, time.Since(startTime).Seconds())
 }
 
-// If there are fewer names than workers subtract workers and if the totalLoad
-// can't be evenly divided among worker subtract workers
+// verifyWorkerCount if there are fewer names than workers subtract workers
 func verifyWorkerCount(totalLoad, workers int) int {
 	ratio := float64(totalLoad) / float64(workers)
-	if ratio == 1 {
+	if ratio == float64(int64(ratio)) {
 		return workers
 	}
 
@@ -105,27 +111,19 @@ func verifyWorkerCount(totalLoad, workers int) int {
 		return workers
 	}
 
-	// If the work can't be evenly divided among the workers in whole numbers
-	// then reduce the number of workers
-	if ratio != float64(int64(ratio)) {
-		for ratio != float64(int64(ratio)) {
-			workers--
-			ratio = float64(totalLoad) / float64(workers)
-		}
-
-		return workers
-	}
-
 	return workers
 }
 
 // calculateLoad divides the totalLoad among the number of workers based on turn
-func calculateLoad(totalLoad, workers, turn int) (start, end int) {
-	load := totalLoad / workers
+func calculateLoad(tasks, workers, turn int) (start, end int) {
+	load := tasks / workers
 
 	// Each turn the start and end index updated based on whose turn it is
 	start = load * turn
 	end = load * (turn + 1)
+	if end < tasks {
+		end = tasks
+	}
 
 	return
 }
@@ -144,35 +142,87 @@ func splitData(data []byte) ([]string, error) {
 	return names, nil
 }
 
-// available check github.com and verifies if the name arg is available
-// if there is an auth strig use signup_check form
-func available(name string, auth string) bool {
+// getAuth makes a requst to github, parses the html response for the authenticity_token
+// and returns any cookies
+func getAuth() (token string, cookies []*http.Cookie) {
 	c := &http.Client{
 		Timeout: time.Second * 10,
 	}
 
-	var res *http.Response
-	var err error
-	if auth == "" {
-		res, err = c.Get(fmt.Sprintf("https://github.com/%s", name))
-		if err != nil {
-			return false
-		}
+	res, err := c.Get("https://github.com/session")
+	if err != nil {
+		return "", nil
+	}
+	defer res.Body.Close()
+	doc, err := html.Parse(res.Body)
+	if err != nil {
+		return "", nil
+	}
 
-		if res.StatusCode == http.StatusOK {
-			return false
+	// Look through html to find authenticity_token
+	var auth string
+	var f func(*html.Node)
+	f = func(n *html.Node) {
+		if n.Data == "input" {
+			for _, a := range n.Attr {
+				if a.Key == "name" {
+					if a.Val == "authenticity_token" {
+						// Now find the value of the name
+						for _, a := range n.Attr {
+							if a.Key == "value" {
+								auth = a.Val
+							}
+						}
+					}
+					break
+				}
+			}
 		}
-	} else {
-		v := url.Values{}
-		v.Set("value", name)
-		res, err = c.PostForm("https://github.com/signup_check/username", v)
-		if err != nil {
-			return false
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
 		}
+	}
+	f(doc)
 
-		if res.StatusCode != http.StatusOK {
-			return false
-		}
+	// fmt.Println(res.Header)
+	cookies = res.Cookies()
+
+	return auth, cookies
+}
+
+// available check github.com and verifies if the name arg is available
+// if there is an auth strig use signup_check form
+func available(name, auth string, cookies []*http.Cookie) bool {
+	c := &http.Client{
+		Timeout: time.Second * 10,
+	}
+
+	apiURL := "https://github.com"
+	resource := "/signup_check/username"
+	data := url.Values{}
+	data.Add("value", name)
+	data.Add("authenticity_token", auth)
+
+	u, err := url.ParseRequestURI(apiURL)
+	u.Path = resource
+	urlStr := fmt.Sprintf("%v", u)
+
+	req, err := http.NewRequest("POST", urlStr, bytes.NewBufferString(data.Encode()))
+	req.Header.Add("content-type", "application/x-www-form-urlencoded")
+	req.Header.Add("Content-Length", strconv.Itoa(len(data.Encode())))
+	req.Header.Add("Referer", "https://github.com/join?source=header-home")
+
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+
+	res, err := c.Do(req)
+	if err != nil {
+		return false
+	}
+
+	if res.StatusCode != http.StatusOK {
+		return false
 	}
 
 	return true
